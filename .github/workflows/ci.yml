@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [fix/production-stability]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: build-placeholder
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Check PDF helper syntax
+        run: python3 -m py_compile scripts/pdf_to_docx.py
