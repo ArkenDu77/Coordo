@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Heart, FileText, Upload, Mic, Play, Check, X, Loader2, Download, AlertCircle, Clock, RotateCcw, Sparkles } from 'lucide-react';
+import { Heart, FileText, Upload, Mic, Check, X, Loader2, Download, AlertCircle, Clock, RotateCcw, Sparkles } from 'lucide-react';
 import { CourseUpdateJob, Suggestion } from '@/lib/db';
 
 export default function Home() {
@@ -219,6 +219,32 @@ function isValidAudio(file: File): boolean {
   return validExtensions.some(ext => name.endsWith(ext));
 }
 
+function normalizedAudioMime(file: SelectedFile): string {
+  const mime = (file.type || '').toLowerCase();
+  if (mime.startsWith('audio/') || mime === 'video/webm' || mime === 'video/ogg') return mime;
+  const name = file.name.toLowerCase();
+  if (name.endsWith('.mp3')) return 'audio/mpeg';
+  if (name.endsWith('.m4a') || name.endsWith('.alac')) return 'audio/mp4';
+  if (name.endsWith('.wav')) return 'audio/wav';
+  if (name.endsWith('.aac')) return 'audio/aac';
+  if (name.endsWith('.ogg') || name.endsWith('.opus')) return 'audio/ogg';
+  if (name.endsWith('.flac')) return 'audio/flac';
+  if (name.endsWith('.webm')) return 'audio/webm';
+  if (name.endsWith('.aiff')) return 'audio/aiff';
+  if (name.endsWith('.wma')) return 'audio/x-ms-wma';
+  return 'audio/mpeg';
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 function extractFilesFromDragEvent(e: React.DragEvent): File[] {
   if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
     return Array.from(e.dataTransfer.files);
@@ -262,8 +288,13 @@ function UploadView({
       alert("Veuillez sélectionner un document valide (.docx, .pdf, .odt, .rtf, .txt, .html, .doc ou image scannée).");
       return;
     }
+    if (file.size > 24 * 1024 * 1024) {
+      alert("Cette fiche dépasse 24 Mo. Réduisez le fichier puis réessayez.");
+      return;
+    }
+    const stableBlob = file.slice(0, file.size, file.type || undefined);
     setDocxData({
-      blob: file,
+      blob: stableBlob,
       name: file.name,
       size: file.size,
       type: file.type,
@@ -276,8 +307,9 @@ function UploadView({
       alert("Veuillez sélectionner un fichier audio valide (MP3, M4A, WAV, AAC, etc.).");
       return;
     }
+    const stableBlob = file.slice(0, file.size, file.type || undefined);
     setAudioData({
-      blob: file,
+      blob: stableBlob,
       name: file.name,
       size: file.size,
       type: file.type,
@@ -372,36 +404,33 @@ function UploadView({
     const courseName = (formData.get('courseName') as string) || 'Nouveau cours';
 
     try {
-      const chunkSize = 5 * 1024 * 1024; // 5 Mo par chunk
+      const chunkSize = 8 * 1024 * 1024;
       let offset = 0;
       let uploadJobId: string | null = null;
 
-      // 1. Initialisation côté serveur
-      onUploadProgress(2, 'Initialisation du transfert et préparation de la fiche...');
+      onUploadProgress(2, 'Préparation de la fiche et initialisation de l’envoi...');
 
       const initData = new FormData();
       initData.append('doc', docxData.blob, docxData.name);
-      initData.append('docx', docxData.blob, docxData.name);
       initData.append('subject', subject);
       initData.append('courseName', courseName);
       initData.append('audioName', audioData.name);
       initData.append('audioSize', audioData.size.toString());
-      initData.append('audioMimeType', audioData.type || 'audio/mp3');
+      initData.append('audioMimeType', normalizedAudioMime(audioData));
 
-      const initRes = await fetch('/api/upload/init', {
-        method: 'POST',
-        body: initData,
-      });
-
-      if (!initRes.ok) {
-        throw new Error("L’analyse n’a pas pu être terminée. Réessayez dans quelques instants.");
+      const initRes = await fetchWithTimeout(
+        '/api/upload/init',
+        { method: 'POST', body: initData },
+        180000
+      );
+      const initJson = await initRes.json().catch(() => ({}));
+      if (!initRes.ok || !initJson?.jobId) {
+        throw new Error(initJson?.error || "Impossible de préparer les fichiers.");
       }
-      const initResult = await initRes.json();
-      uploadJobId = initResult.jobId;
+      uploadJobId = initJson.jobId;
 
-      // Création du squelette du job pour transitionner immédiatement vers ProcessingView
       const initialJob: CourseUpdateJob = {
-        id: uploadJobId!,
+        id: uploadJobId,
         createdAt: new Date().toISOString(),
         status: 'uploading',
         subject,
@@ -421,69 +450,102 @@ function UploadView({
         suggestions: [],
       };
 
-      // Basculer l'écran vers ProcessingView immédiatement
-      onJobCreated(uploadJobId!, initialJob);
+      onJobCreated(uploadJobId, initialJob);
       onUploadProgress(5, 'Envoi de l’audio...');
 
-      // 2. Envoi par morceaux de l'audio (0–20 % de la progression globale)
-      while (offset < audioData.size) {
-        const chunk = audioData.blob.slice(offset, offset + chunkSize);
-        const isLast = offset + chunk.size >= audioData.size;
+      const readServerOffset = async (): Promise<number | 'final' | null> => {
+        try {
+          const response = await fetch(
+            `/api/upload/status?jobId=${encodeURIComponent(uploadJobId!)}`,
+            { cache: 'no-store' }
+          );
+          if (!response.ok) return null;
+          const json = await response.json();
+          if (json?.offset === 'final') return 'final';
+          const serverOffset = Number(json?.offset);
+          return Number.isSafeInteger(serverOffset) && serverOffset >= 0 ? serverOffset : null;
+        } catch {
+          return null;
+        }
+      };
 
-        let attempts = 0;
-        let success = false;
-        
-        while (!success && attempts < 3) {
+      while (offset < audioData.size) {
+        const currentOffset = offset;
+        const chunk = audioData.blob.slice(currentOffset, currentOffset + chunkSize);
+        const isLast = currentOffset + chunk.size >= audioData.size;
+        let completed = false;
+
+        for (let attempt = 1; attempt <= 4 && !completed; attempt++) {
           try {
-            const chunkRes = await fetch('/api/upload/chunk', {
-              method: 'POST',
-              headers: {
-                'x-job-id': uploadJobId!,
-                'x-offset': offset.toString(),
-                'x-is-last': isLast.toString(),
-                'Content-Type': 'application/octet-stream',
+            const chunkRes = await fetchWithTimeout(
+              '/api/upload/chunk',
+              {
+                method: 'POST',
+                headers: {
+                  'x-job-id': uploadJobId,
+                  'x-offset': String(currentOffset),
+                  'x-chunk-size': String(chunk.size),
+                  'x-is-last': String(isLast),
+                  'Content-Type': 'application/octet-stream',
+                },
+                body: chunk,
               },
-              body: chunk,
-            });
-            if (chunkRes.ok) {
-              success = true;
-            } else {
-              throw new Error("Erreur serveur lors du chunk");
+              120000
+            );
+
+            if (!chunkRes.ok) {
+              const errJson = await chunkRes.json().catch(() => ({}));
+              throw new Error(errJson?.error || 'Erreur serveur pendant l’envoi audio.');
             }
-          } catch (err) {
-            attempts++;
-            await new Promise(r => setTimeout(r, 1500));
+
+            const body = await chunkRes.json().catch(() => ({}));
+            offset = body?.finalized
+              ? audioData.size
+              : Number.isSafeInteger(Number(body?.nextOffset))
+                ? Number(body.nextOffset)
+                : currentOffset + chunk.size;
+            completed = true;
+          } catch (error) {
+            const serverOffset = await readServerOffset();
+            if (serverOffset === 'final') {
+              offset = audioData.size;
+              completed = true;
+              break;
+            }
+            if (typeof serverOffset === 'number' && serverOffset !== currentOffset) {
+              offset = serverOffset;
+              completed = true;
+              break;
+            }
+            if (attempt === 4) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 700 * attempt));
           }
         }
 
-        if (!success) {
-          throw new Error("Échec de l’envoi après plusieurs tentatives");
-        }
+        if (!completed) throw new Error("Échec de l’envoi audio après plusieurs tentatives.");
 
-        offset += chunk.size;
         const uploadFraction = Math.min(1, offset / audioData.size);
-        const stagePercent = Math.min(20, Math.round(5 + uploadFraction * 15));
         onUploadProgress(
-          stagePercent,
-          isLast ? 'Envoi terminé, préparation de la fiche...' : `Envoi de l’audio (${Math.round(uploadFraction * 100)}%)...`
+          Math.min(20, Math.round(5 + uploadFraction * 15)),
+          uploadFraction >= 1
+            ? 'Envoi terminé, préparation de la fiche...'
+            : `Envoi de l’audio (${Math.round(uploadFraction * 100)}%)...`
         );
       }
 
       onUploadFinished();
 
-      // 3. Déclencher le traitement serveur (attente réelle de la fin du traitement)
       const processRes = await fetch(`/api/jobs/${uploadJobId}/process`, { method: 'POST' });
       if (!processRes.ok) {
         const errJson = await processRes.json().catch(() => ({}));
-        const userMsg = errJson?.error || "L’analyse n’a pas pu être terminée. Réessayez dans quelques instants.";
-        onUploadFailed(userMsg);
+        onUploadFailed(errJson?.error || "L’analyse n’a pas pu être terminée. Réessayez.");
       }
     } catch (err: any) {
       console.error('[Upload Pipeline Error]', err);
-      const errMsg = err?.message?.includes('trop de temps')
-        ? "L’analyse a pris trop de temps. Veuillez réessayer."
-        : (err?.message || "L’analyse n’a pas pu être terminée. Réessayez dans quelques instants.");
-      onUploadFailed(errMsg);
+      const message = err?.name === 'AbortError'
+        ? "L’envoi a pris trop de temps. Vérifiez la connexion puis réessayez."
+        : (err?.message || "L’analyse n’a pas pu être terminée. Réessayez.");
+      onUploadFailed(message);
       setLoading(false);
     }
   }
@@ -772,7 +834,7 @@ function ProcessingView({
 
       {/* Note rassurante de persistance */}
       <p className="text-xs text-pink-500/90 text-center leading-relaxed">
-        Le traitement s’exécute sur nos serveurs. Vous pouvez quitter cette page ou la recharger à tout moment : votre progression est conservée automatiquement.
+        Gardez cette page ouverte pendant l’analyse. L’envoi est repris automatiquement après une coupure réseau courte.
       </p>
     </motion.div>
   );
@@ -783,6 +845,7 @@ function ReviewView({ job, setJob }: { job: CourseUpdateJob, setJob: any }) {
   const [localJob, setLocalJob] = useState(job);
 
   const additions = localJob.suggestions.filter(s => s.type === 'ADD').length;
+  const replacements = localJob.suggestions.filter(s => s.type === 'REPLACE').length;
   const deletions = localJob.suggestions.filter(s => s.type === 'DELETE').length;
   const toVerify = localJob.suggestions.filter(s => s.type === 'VERIFY').length;
   
@@ -820,6 +883,7 @@ function ReviewView({ job, setJob }: { job: CourseUpdateJob, setJob: any }) {
         <h2 className="text-3xl font-extrabold text-pink-700 mb-4">Actualisation terminée</h2>
         <div className="flex flex-wrap justify-center gap-4 text-sm font-medium">
           <span className="bg-emerald-50 text-emerald-700 px-4 py-2 rounded-full">{additions} ajouts proposés</span>
+          <span className="bg-sky-50 text-sky-700 px-4 py-2 rounded-full">{replacements} modifications proposées</span>
           <span className="bg-rose-50 text-rose-700 px-4 py-2 rounded-full">{deletions} suppressions proposées</span>
           <span className="bg-amber-50 text-amber-700 px-4 py-2 rounded-full">{toVerify} éléments à vérifier</span>
         </div>
@@ -856,22 +920,35 @@ function ReviewView({ job, setJob }: { job: CourseUpdateJob, setJob: any }) {
 
 function SuggestionCard({ suggestion, onUpdate }: { suggestion: Suggestion, onUpdate: (status: 'accepted' | 'rejected') => void }) {
   const isAdd = suggestion.type === 'ADD';
+  const isReplace = suggestion.type === 'REPLACE';
   const isVerify = suggestion.type === 'VERIFY';
 
-  const colorCls = isAdd ? 'text-emerald-700 bg-emerald-50 border-emerald-100' : isVerify ? 'text-amber-700 bg-amber-50 border-amber-100' : 'text-rose-700 bg-rose-50 border-rose-100';
-  const badgeCls = isAdd ? 'bg-emerald-100 text-emerald-800' : isVerify ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800';
+  const colorCls = isAdd
+    ? 'text-emerald-700 bg-emerald-50 border-emerald-100'
+    : isReplace
+    ? 'text-sky-700 bg-sky-50 border-sky-100'
+    : isVerify
+    ? 'text-amber-700 bg-amber-50 border-amber-100'
+    : 'text-rose-700 bg-rose-50 border-rose-100';
+  const badgeCls = isAdd
+    ? 'bg-emerald-100 text-emerald-800'
+    : isReplace
+    ? 'bg-sky-100 text-sky-800'
+    : isVerify
+    ? 'bg-amber-100 text-amber-800'
+    : 'bg-rose-100 text-rose-800';
 
   return (
     <div className={`p-6 rounded-[2rem] border ${colorCls} transition-all ${suggestion.status !== 'pending' ? 'opacity-50 grayscale' : ''}`}>
       <div className="flex justify-between items-start mb-4">
         <span className={`text-xs font-bold uppercase tracking-wider px-3 py-1 rounded-full ${badgeCls}`}>
-          {isAdd ? 'Ajout Proposé' : isVerify ? 'À Vérifier' : 'Suppression Proposée'}
+          {isAdd ? 'Ajout proposé' : isReplace ? 'Modification proposée' : isVerify ? 'À vérifier' : 'Suppression proposée'}
         </span>
         <div className="flex gap-2">
           {suggestion.status === 'pending' ? (
             <>
               <button onClick={() => onUpdate('rejected')} className="px-4 py-2 rounded-xl bg-white/50 hover:bg-white text-sm font-bold transition-colors">
-                {isAdd ? 'REFUSER' : 'CONSERVER'}
+                {isAdd || isReplace ? 'REFUSER' : 'CONSERVER'}
               </button>
               <button onClick={() => onUpdate('accepted')} className="px-4 py-2 rounded-xl bg-white hover:shadow-sm text-sm font-bold transition-all shadow-sm">
                 ACCEPTER
@@ -885,13 +962,21 @@ function SuggestionCard({ suggestion, onUpdate }: { suggestion: Suggestion, onUp
         </div>
       </div>
 
-      <div className="mb-4 bg-white/60 p-4 rounded-2xl">
-        <p className="text-xs font-bold uppercase tracking-wider mb-2 opacity-60">
-          {isAdd ? 'Nouvelle information :' : 'Texte actuel :'}
-        </p>
-        <p className={`font-serif text-lg leading-relaxed ${!isAdd ? 'line-through opacity-70' : ''}`}>
-          {isAdd ? suggestion.proposedText : suggestion.originalText}
-        </p>
+      <div className="mb-4 bg-white/60 p-4 rounded-2xl space-y-3">
+        {isReplace && suggestion.originalText && (
+          <div>
+            <p className="text-xs font-bold uppercase tracking-wider mb-1 opacity-60">Texte actuel :</p>
+            <p className="font-serif text-base leading-relaxed line-through opacity-60">{suggestion.originalText}</p>
+          </div>
+        )}
+        <div>
+          <p className="text-xs font-bold uppercase tracking-wider mb-2 opacity-60">
+            {isAdd ? 'Nouvelle information :' : isReplace ? 'Texte actualisé :' : 'Texte concerné :'}
+          </p>
+          <p className={`font-serif text-lg leading-relaxed ${suggestion.type === 'DELETE' ? 'line-through opacity-70' : ''}`}>
+            {isAdd || isReplace || isVerify ? (suggestion.proposedText || suggestion.originalText) : suggestion.originalText}
+          </p>
+        </div>
       </div>
 
       <div className="grid md:grid-cols-2 gap-4 text-sm">
@@ -907,9 +992,7 @@ function SuggestionCard({ suggestion, onUpdate }: { suggestion: Suggestion, onUp
           {suggestion.audioEvidence && (
             <div className="mt-3 flex items-center gap-2">
               <span className="font-mono bg-white/50 px-2 py-1 rounded-lg">{suggestion.audioEvidence}</span>
-              <button className="flex items-center gap-1 bg-white hover:bg-white/80 px-3 py-1 rounded-lg transition-colors font-semibold">
-                <Play className="w-3 h-3" /> Écouter
-              </button>
+              <span className="text-xs opacity-70">Repère audio</span>
             </div>
           )}
         </div>
@@ -926,7 +1009,7 @@ function CompletedView({ jobId, onNewUpload }: { jobId: string; onNewUpload?: ()
       </div>
       <h2 className="text-3xl font-extrabold text-pink-700 mb-4">Fiche générée avec succès !</h2>
       <p className="text-pink-600 mb-8 leading-relaxed">
-        La fiche actualisée a été créée tout en conservant strictement la mise en page d&apos;origine. Les modifications sont surlignées en bleu.
+        La fiche actualisée a été créée à partir du document maître. Les ajouts sont en gras surligné cyan et les suppressions sont barrées en cyan.
       </p>
       <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
         <a 
