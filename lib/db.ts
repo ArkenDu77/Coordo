@@ -48,7 +48,7 @@ export interface JobProgress {
 
 export interface Suggestion {
   id: string;
-  type: 'ADD' | 'DELETE' | 'VERIFY';
+  type: 'ADD' | 'DELETE' | 'REPLACE' | 'VERIFY';
   targetBlock?: string;
   proposedText?: string;
   originalText?: string;
@@ -121,5 +121,7 @@ export function getAllJobs(): CourseUpdateJob[] {
 }
 
 export function getUploadPath(filename: string) {
-  return path.join(UPLOADS_DIR, `${uuidv4()}-${filename}`);
+  const safeName = path.basename(filename || 'fichier').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(-180);
+  return path.join(UPLOADS_DIR, `${uuidv4()}-${safeName || 'fichier'}`);
 }
+

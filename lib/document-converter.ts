@@ -337,6 +337,88 @@ async function buildDocxFromStructuredElements(
   fs.writeFileSync(outputPath, buffer);
 }
 
+
+function normalizeWords(text: string): string[] {
+  return (text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9à-ÿ]+/gi, ' ')
+    .split(/\s+/)
+    .filter((word) => word.length >= 2);
+}
+
+function wordCoverage(sourceText: string, convertedText: string): number {
+  const sourceWords = normalizeWords(sourceText);
+  const convertedSet = new Set(normalizeWords(convertedText));
+  if (sourceWords.length === 0) return 1;
+  let matched = 0;
+  for (const word of sourceWords) if (convertedSet.has(word)) matched++;
+  return matched / sourceWords.length;
+}
+
+async function extractPdfText(inputPath: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('pdftotext', ['-enc', 'UTF-8', inputPath, '-'], {
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    return stdout || '';
+  } catch {
+    return '';
+  }
+}
+
+async function extractDocxText(inputPath: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('pandoc', [inputPath, '-t', 'plain'], {
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    return stdout || '';
+  } catch {
+    return '';
+  }
+}
+
+async function convertDigitalPdfHighFidelity(inputPath: string, outputPath: string): Promise<void> {
+  const scriptPath = path.join(process.cwd(), 'scripts', 'pdf_to_docx.py');
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error('Convertisseur PDF haute fidélité absent du serveur.');
+  }
+
+  try {
+    await execFileAsync('python3', [scriptPath, inputPath, outputPath], {
+      timeout: 180000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+  } catch (error: any) {
+    const detail = error?.stderr || error?.message || 'erreur inconnue';
+    console.error('[PDF high-fidelity conversion failed]', detail);
+    throw new Error(
+      "La conversion PDF haute fidélité a échoué. Réessayez ou utilisez le DOCX d'origine si vous l'avez."
+    );
+  }
+
+  if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 1500) {
+    throw new Error("La conversion PDF n'a pas produit de document Word exploitable.");
+  }
+
+  const [sourceText, convertedText] = await Promise.all([
+    extractPdfText(inputPath),
+    extractDocxText(outputPath),
+  ]);
+
+  if (normalizeWords(sourceText).length >= 80) {
+    const coverage = wordCoverage(sourceText, convertedText);
+    if (coverage < 0.82) {
+      console.error(`[PDF conversion quality gate] text coverage=${coverage.toFixed(3)}`);
+      try { fs.unlinkSync(outputPath); } catch {}
+      throw new Error(
+        "Le PDF n'a pas pu être converti avec une fidélité suffisante. Utilisez le DOCX d'origine si disponible."
+      );
+    }
+  }
+}
+
 /**
  * CAS PDF & CAS IMAGE / SCAN:
  * Utilise l'OCR multimodal Gemini pour extraire fidèlement le contenu et la structure visuelle,
@@ -399,7 +481,7 @@ DIRECTIVES CRUCIALES :
 `;
 
   const response = await ai.models.generateContent({
-    model: 'gemini-2.5-flash',
+    model: 'gemini-3.8-flash',
     contents: [
       {
         role: 'user',
@@ -497,11 +579,23 @@ export async function convertToMasterDocx(
       await convertDocToDocx(inputFilePath, masterDocxPath);
       break;
 
-    case 'pdf':
-    case 'image':
-      const ocrRes = await convertMediaWithGeminiOcr(inputFilePath, masterDocxPath, format);
-      warning = ocrRes.warning;
+    case 'pdf': {
+      const pdfText = await extractPdfText(inputFilePath);
+      const isDigitalPdf = normalizeWords(pdfText).length >= 40;
+      if (isDigitalPdf) {
+        await convertDigitalPdfHighFidelity(inputFilePath, masterDocxPath);
+      } else {
+        const ocrRes = await convertMediaWithGeminiOcr(inputFilePath, masterDocxPath, 'pdf');
+        warning = ocrRes.warning || 'PDF scanné détecté : la mise en page a été reconstruite et doit être vérifiée avant export.';
+      }
       break;
+    }
+
+    case 'image': {
+      const ocrRes = await convertMediaWithGeminiOcr(inputFilePath, masterDocxPath, 'image');
+      warning = ocrRes.warning || 'Document scanné : vérifiez rapidement la mise en page reconstruite avant export.';
+      break;
+    }
 
     default:
       throw new Error('Ce format de fichier n’est pas encore pris en charge.');

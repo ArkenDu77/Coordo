@@ -4,28 +4,38 @@ import { parseDocx, extractTextWithIds } from '@/lib/docx';
 import { processCourseAudio } from '@/lib/gemini';
 import fs from 'fs';
 
-export const maxDuration = 1200; // 20 minutes maximum
+export const maxDuration = 1200;
 export const dynamic = 'force-dynamic';
 
-export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+export async function POST(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const job = getJob(id);
-  if (!job) {
-    return NextResponse.json({ error: 'Job non trouvé' }, { status: 404 });
-  }
+  if (!job) return NextResponse.json({ error: 'Job non trouvé.' }, { status: 404 });
 
-  // Si le job est déjà terminé avec succès, renvoyer immédiatement
   if (job.status === 'review' || job.status === 'completed') {
     return NextResponse.json({ success: true, status: job.status });
   }
 
-  // Initialisation du statut de traitement
+  if (!job.geminiFileName || !job.geminiFileUri || !job.geminiMimeType) {
+    job.status = 'failed';
+    job.error = "L’envoi audio n’a pas été finalisé. Veuillez renvoyer le fichier.";
+    saveJob(job);
+    return NextResponse.json({ error: job.error }, { status: 409 });
+  }
+  if (!job.originalDocxPath || !fs.existsSync(job.originalDocxPath)) {
+    job.status = 'failed';
+    job.error = 'La fiche préparée n’est plus disponible. Veuillez recommencer.';
+    saveJob(job);
+    return NextResponse.json({ error: job.error }, { status: 410 });
+  }
+
   job.status = 'processing';
+  job.error = undefined;
   job.progress = {
     percent: 20,
     stage: 'doc_prep',
     stageLabel: 'Préparation de la fiche',
-    message: 'Fichiers reçus, préparation de la fiche et de l’audio...',
+    message: 'Fichiers reçus, préparation de la comparaison...',
     stepDescription: 'Extraction des paragraphes et métadonnées...',
     etaFormatted: job.progress?.etaFormatted || 'Temps restant estimé : quelques minutes',
     startedAt: Date.now(),
@@ -34,24 +44,19 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   saveJob(job);
 
   try {
-    // 1. Extraction et indexation du DOCX
     const docxBuffer = fs.readFileSync(job.originalDocxPath);
     const { doc } = parseDocx(docxBuffer);
     const blocks = extractTextWithIds(doc);
-    const mappedBlocks = blocks.map(b => ({ stableId: b.stableId, text: b.text }));
+    const mappedBlocks = blocks.map((block) => ({ stableId: block.stableId, text: block.text }));
+    if (!mappedBlocks.length) throw new Error('La fiche ne contient aucun texte exploitable.');
 
-    // 2. Traitement direct et synchrone de l'audio : la requête HTTP attend VRAIMENT la fin
-    console.log(`[Job ${job.id}] Démarrage synchrone de l'analyse audio...`);
     const suggestions = await processCourseAudio(
-      job.geminiFileName!,
-      job.geminiFileUri!,
-      job.geminiMimeType!,
+      job.geminiFileName,
+      job.geminiFileUri,
+      job.geminiMimeType,
       mappedBlocks,
       (progressUpdate) => {
-        job.progress = {
-          ...job.progress,
-          ...progressUpdate,
-        };
+        job.progress = { ...job.progress, ...progressUpdate };
         saveJob(job);
       },
       {
@@ -63,13 +68,14 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       }
     );
 
-    // 3. Enregistrement des suggestions et passage en mode révision
     job.suggestions = suggestions;
     job.progress = {
       percent: 100,
       stage: 'completed',
       stageLabel: 'Actualisation terminée',
-      message: '100 % — Actualisation terminée',
+      message: suggestions.length
+        ? 'Actualisation terminée : vérifiez les propositions.'
+        : 'Aucune modification fiable n’a été détectée.',
       stepDescription: 'Actualisation terminée',
       etaFormatted: '0 s',
       estimatedRemainingSeconds: 0,
@@ -77,31 +83,17 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     job.status = 'review';
     saveJob(job);
 
-    console.log(`[Job ${job.id}] Analyse terminée avec succès : ${suggestions.length} suggestions générées.`);
-    return NextResponse.json({
-      success: true,
-      status: 'review',
-      suggestionsCount: suggestions.length,
-    });
-  } catch (err: any) {
-    console.error(`[Job ${job.id} Error]`, {
-      message: err?.message,
-      stack: err?.stack,
-    });
-
+    return NextResponse.json({ success: true, status: 'review', suggestionsCount: suggestions.length });
+  } catch (error: any) {
+    console.error(`[Job ${job.id} error]`, error?.message || error);
     job.status = 'failed';
-    const isTimeout = err?.message?.includes('trop de temps') || err?.name === 'AbortError';
-    job.error = isTimeout 
-      ? "L’analyse a pris trop de temps. Veuillez réessayer."
-      : (err?.message || "L’analyse n’a pas pu être terminée. Réessayez dans quelques instants.");
-
+    job.error = error?.message || "L’analyse n’a pas pu être terminée. Réessayez.";
     job.progress = {
       ...job.progress,
-      message: "Échec de l'analyse",
+      message: 'Échec de l’analyse',
       stepDescription: job.error,
     };
     saveJob(job);
-
     return NextResponse.json({ error: job.error }, { status: 500 });
   }
 }

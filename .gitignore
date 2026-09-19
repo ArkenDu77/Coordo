@@ -5,3 +5,7 @@ coverage/
 *.log
 .env*
 !.env.example
+
+data/jobs/*.json
+data/uploads/*
+data/analytics/*.json
