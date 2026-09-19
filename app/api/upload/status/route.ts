@@ -6,14 +6,17 @@ export const dynamic = 'force-dynamic';
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const jobId = searchParams.get('jobId');
-
-  if (!jobId) {
-    return NextResponse.json({ error: 'Missing jobId' }, { status: 400 });
-  }
+  if (!jobId) return NextResponse.json({ error: 'jobId manquant.' }, { status: 400 });
 
   const job = getJob(jobId);
-  if (!job || !job.geminiUploadUrl) {
-    return NextResponse.json({ error: 'Job not found or invalid' }, { status: 404 });
+  if (!job) return NextResponse.json({ error: 'Session introuvable.' }, { status: 404 });
+
+  // Finalization already persisted server-side.
+  if (job.geminiFileName && job.geminiFileUri) {
+    return NextResponse.json({ offset: 'final' });
+  }
+  if (!job.geminiUploadUrl) {
+    return NextResponse.json({ error: 'Session d’envoi expirée.' }, { status: 410 });
   }
 
   try {
@@ -21,26 +24,23 @@ export async function GET(req: NextRequest) {
       method: 'POST',
       headers: {
         'X-Goog-Upload-Protocol': 'resumable',
-        'X-Goog-Upload-Command': 'query'
-      }
+        'X-Goog-Upload-Command': 'query',
+      },
+      cache: 'no-store',
     });
 
     if (!queryRes.ok) {
-       return NextResponse.json({ error: 'Query failed' }, { status: queryRes.status });
+      return NextResponse.json({ error: 'Impossible de reprendre la session.' }, { status: 502 });
     }
 
     const status = queryRes.headers.get('x-goog-upload-status');
     if (status === 'active') {
-      const received = queryRes.headers.get('x-goog-upload-size-received') || '0';
-      return NextResponse.json({ offset: received });
-    } else if (status === 'final') {
-       return NextResponse.json({ offset: 'final' });
-    } else {
-       return NextResponse.json({ error: 'Session cancelled or unknown status' }, { status: 400 });
+      return NextResponse.json({ offset: queryRes.headers.get('x-goog-upload-size-received') || '0' });
     }
-
-  } catch (e) {
-    console.error('Error checking status:', e);
-    return NextResponse.json({ error: 'Server error' }, { status: 500 });
+    if (status === 'final') return NextResponse.json({ offset: 'final' });
+    return NextResponse.json({ error: 'Session Gemini annulée.' }, { status: 410 });
+  } catch (error) {
+    console.error('[Upload status error]', error);
+    return NextResponse.json({ error: 'Erreur réseau pendant la reprise.' }, { status: 502 });
   }
 }
