@@ -406,8 +406,6 @@ function UploadView({
     try {
       const chunkSize = 8 * 1024 * 1024;
       let offset = 0;
-      let uploadJobId: string | null = null;
-
       onUploadProgress(2, 'Préparation de la fiche et initialisation de l’envoi...');
 
       const initData = new FormData();
@@ -427,7 +425,7 @@ function UploadView({
       if (!initRes.ok || !initJson?.jobId) {
         throw new Error(initJson?.error || "Impossible de préparer les fichiers.");
       }
-      uploadJobId = initJson.jobId;
+      const uploadJobId: string = String(initJson.jobId);
 
       const initialJob: CourseUpdateJob = {
         id: uploadJobId,
@@ -456,7 +454,7 @@ function UploadView({
       const readServerOffset = async (): Promise<number | 'final' | null> => {
         try {
           const response = await fetch(
-            `/api/upload/status?jobId=${encodeURIComponent(uploadJobId!)}`,
+            `/api/upload/status?jobId=${encodeURIComponent(uploadJobId)}`,
             { cache: 'no-store' }
           );
           if (!response.ok) return null;
