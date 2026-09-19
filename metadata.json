@@ -1,0 +1,6 @@
+{
+  "name": "Co-Ordo",
+  "description": "Actualisez vos fiches de cours automatiquement à partir d'enregistrements audio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

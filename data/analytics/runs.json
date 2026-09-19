@@ -1,0 +1,12 @@
+[
+  {
+    "id": "93520d1a-1628-4e64-a906-6e57665a93e5",
+    "timestamp": 1789767137290,
+    "audioSizeBytes": 32044,
+    "documentSizeBytes": 54,
+    "documentType": "txt",
+    "model": "gemini-3.1-pro-preview",
+    "totalDurationMs": 13799,
+    "geminiDurationMs": 12814
+  }
+]
